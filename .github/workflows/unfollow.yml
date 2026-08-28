@@ -1,0 +1,60 @@
+name: Twitter 24/7 Ghost & Bot Purger
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+  schedule:
+    - cron: '0 */3 * * *' # Automatically runs every 3 hours
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'unfollowed_history.json'
+      - 'following_cleanup_audit.csv'
+      - 'README.md'
+
+concurrency:
+  group: twitter-ghost-purger
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run-unfollower:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Configure Git for Auto-Commits
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run Ghost & Bot Purge
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          CT0_CSRF: ${{ secrets.CT0_CSRF }}
+        run: |
+          python x_ghost_bot_purger.py --auto --limit 60
+
+      - name: Save & Push Progress
+        if: always()
+        run: |
+          git pull --rebase origin main || true
+          if [ -f unfollowed_history.json ]; then
+            git add unfollowed_history.json following_cleanup_audit.csv || true
+            git diff --staged --quiet || (git commit -m "chore: auto-save unfollow progress [skip ci]" && git push origin main)
+          fi

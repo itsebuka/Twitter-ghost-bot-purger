@@ -1,0 +1,12 @@
+# ==============================================================================
+# X (Twitter) Ghost & Bot Purger - Protected Whitelist
+# Add handles or user IDs (one per line) that should NEVER be unfollowed.
+# ==============================================================================
+
+# Core Designated Handles (Always Protected)
+pau_nigeria
+IkejaElectric
+vireontech
+
+# Add your personal friends, mentors, or collaborators below:
+# example_handle

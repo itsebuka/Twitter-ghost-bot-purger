@@ -1,7 +1,9 @@
 """
-X (Twitter) Ghost & Bot Account Purger
-Audits and un-follows ghost accounts, bot/spam profiles, and low-signal non-mutuals
-while strictly preserving mutuals, designated handles, verified accounts, and engineering connections.
+X (Twitter) Automated Ghost, Bot & Inactivity Purging Engine
+Audits and un-follows ghost accounts (inactive >2 months / 60 days), bot/spam profiles,
+and low-signal non-mutuals while strictly preserving mutuals, designated handles,
+verified accounts, and engineering connections.
+Supports 24/7 background execution via GitHub Actions.
 """
 
 import argparse
@@ -9,12 +11,13 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timezone
 import requests
 
-# Reconfigure stdout for UTF-8 on Windows
+# Reconfigure stdout for UTF-8 on Windows consoles
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -33,22 +36,23 @@ except ImportError:
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip() or "51c752155f1489e7a36ed3595bb4a68ded7bf42d"
 CT0_CSRF   = os.getenv("CT0_CSRF", "").strip() or "a21abe5bf24a95c8a2f9d2483a8c7001eafbbaf152226c3effa1f61a56d53c51633b820ef80398ba8b122645dcc20d5946cfaa626f28f083e0f23d9cc18ad229fb2024360280a4194ae7172e3a62fa42"
 
-PROFILES_JSON_FILE = os.getenv("PROFILES_JSON", "following_profiles.json")
-WHITELIST_FILE     = os.getenv("WHITELIST_FILE", "whitelist.txt")
-AUDIT_CSV_FILE     = os.getenv("AUDIT_CSV_FILE", "following_cleanup_audit.csv")
-HISTORY_LOG_FILE   = os.getenv("HISTORY_LOG_FILE", "unfollowed_history.log")
-PROGRESS_JSON_FILE = os.getenv("PROGRESS_JSON_FILE", "unfollowed_history.json")
+INACTIVITY_DAYS_THRESHOLD = int(os.getenv("INACTIVITY_DAYS_THRESHOLD", "60"))
 
-UNFOLLOW_API_URL   = "https://x.com/i/api/1.1/friendships/destroy.json"
+PROFILES_JSON_FILE  = os.getenv("PROFILES_JSON_FILE", "following_profiles.json")
+FOLLOWING_ARCHIVE   = os.getenv("FOLLOWING_ARCHIVE", "following.js")
+WHITELIST_FILE      = os.getenv("WHITELIST_FILE", "whitelist.txt")
+AUDIT_CSV_FILE      = os.getenv("AUDIT_CSV_FILE", "following_cleanup_audit.csv")
+HISTORY_LOG_FILE    = os.getenv("HISTORY_LOG_FILE", "unfollowed_history.log")
+PROGRESS_JSON_FILE  = os.getenv("PROGRESS_JSON_FILE", "unfollowed_history.json")
 
-# Core designated handles permanently protected
+UNFOLLOW_API_URL    = "https://x.com/i/api/1.1/friendships/destroy.json"
+
 CORE_PROTECTED_HANDLES = {
     "pau_nigeria",
     "ikejaelectric",
     "vireontech",
 }
 
-# Niche engineering & tech keywords for bio matching
 ENGINEERING_KEYWORDS = [
     "hardware", "pcb", "electronics", "embedded", "firmware",
     "robotics", "cad", "defense", "founder", "engineer",
@@ -68,27 +72,32 @@ session.headers.update(HEADERS)
 # =============================================================
 
 def load_whitelist():
-    """Loads custom whitelisted handles from whitelist.txt."""
+    """Loads custom whitelisted handles from whitelist.txt / whitelist.json."""
     whitelist = set()
     if os.path.exists(WHITELIST_FILE):
         try:
-            with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    clean = line.strip().lstrip("@").lower()
-                    if clean and not clean.startswith("#"):
-                        whitelist.add(clean)
+            if WHITELIST_FILE.endswith(".json"):
+                with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    whitelist.update(str(x).strip().lstrip("@").lower() for x in data)
+            else:
+                with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        clean = line.strip().lstrip("@").lower()
+                        if clean and not clean.startswith("#"):
+                            whitelist.add(clean)
         except Exception as e:
             print(f"[!] Warning reading whitelist file: {e}")
     return whitelist
 
 def load_unfollowed_history():
-    """Loads set of user handles / IDs already unfollowed in past runs."""
+    """Loads set of user IDs already unfollowed in past runs."""
     history = set()
     if os.path.exists(PROGRESS_JSON_FILE):
         try:
             with open(PROGRESS_JSON_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                history.update(str(x).lower() for x in data)
+                history.update(str(x) for x in data)
         except Exception:
             pass
     if os.path.exists(HISTORY_LOG_FILE):
@@ -97,19 +106,16 @@ def load_unfollowed_history():
                 for line in f:
                     parts = line.strip().split(",")
                     if parts and parts[0]:
-                        history.add(parts[0].strip().lower())
+                        history.add(parts[0].strip())
         except Exception:
             pass
     return history
 
-def record_unfollow_success(handle_or_id, screen_name=""):
-    """Persists unfollowed user to history log and JSON."""
-    key = str(handle_or_id).lower()
+def record_unfollow_success(user_id, screen_name=""):
+    """Persists unfollowed user ID to history log and JSON."""
+    user_id_str = str(user_id)
     history = load_unfollowed_history()
-    history.add(key)
-    if screen_name:
-        history.add(screen_name.lower())
-
+    history.add(user_id_str)
     try:
         with open(PROGRESS_JSON_FILE, "w", encoding="utf-8") as f:
             json.dump(list(history), f, indent=2)
@@ -119,58 +125,157 @@ def record_unfollow_success(handle_or_id, screen_name=""):
     try:
         with open(HISTORY_LOG_FILE, "a", encoding="utf-8") as f:
             timestamp = datetime.now(timezone.utc).isoformat()
-            f.write(f"{handle_or_id},{screen_name},{timestamp}\n")
+            f.write(f"{user_id_str},{screen_name},{timestamp}\n")
     except Exception as e:
         print(f"[!] Warning appending to history log: {e}")
 
-def load_profiles_dataset():
-    """Loads rich profile dataset from following_profiles.json."""
-    if not os.path.exists(PROFILES_JSON_FILE):
-        print(f"[!] Missing rich profiles file '{PROFILES_JSON_FILE}'.")
-        return []
+def load_following_dataset():
+    """Loads rich profiles from following_profiles.json if available, or archive following.js as fallback."""
+    if os.path.exists(PROFILES_JSON_FILE):
+        print(f"[*] Loading rich profiles from: {PROFILES_JSON_FILE}...")
+        try:
+            with open(PROFILES_JSON_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[!] Error reading '{PROFILES_JSON_FILE}': {e}")
 
-    with open(PROFILES_JSON_FILE, "r", encoding="utf-8") as f:
-        profiles = json.load(f)
-    return profiles
+    if os.path.exists(FOLLOWING_ARCHIVE):
+        print(f"[*] Fallback: Loading archive from: {FOLLOWING_ARCHIVE}...")
+        with open(FOLLOWING_ARCHIVE, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+            json_clean = re.sub(r"^window\.YTD\.following\w*\.part\d*\s*=\s*", "", raw_text)
+            data = json.loads(json_clean)
 
-def evaluate_profile(profile, custom_whitelist):
+        accounts = []
+        for item in data:
+            f_obj = item.get("following", item)
+            account_id = f_obj.get("accountId")
+            if account_id:
+                accounts.append({
+                    "rest_id": str(account_id),
+                    "screen_name": str(account_id)
+                })
+        return accounts
+
+    return []
+
+def evaluate_account(profile, custom_whitelist):
     """
-    Evaluates account against Whitelist rules and Purge criteria.
-    Returns: (verdict, reason)
+    Evaluates profile against Whitelist rules and Purge criteria.
+    Returns: (verdict, reason, is_bot, days_inactive, last_post_str)
     """
     screen_name = str(profile.get("screen_name", "")).strip().lstrip("@").lower()
     rest_id = str(profile.get("rest_id", "") or profile.get("id_str", "")).strip()
     bio = str(profile.get("description", "")).lower()
+    followers_count = profile.get("followers_count", 0)
+    friends_count = profile.get("friends_count", 0)
+    statuses_count = profile.get("statuses_count", None)
+    profile_image_url = profile.get("profile_image_url_https", "")
 
-    # Rule 1: Core Designated Handles or Custom Whitelist
+    # Calculate days inactive
+    last_post_date = profile.get("last_post_date")
+    days_inactive = "N/A"
+    last_post_str = "Unknown"
+    is_inactive_2mo = False
+
+    if last_post_date:
+        try:
+            if isinstance(last_post_date, str):
+                try:
+                    dt = datetime.strptime(last_post_date, "%a %b %d %H:%M:%S %z %Y")
+                except ValueError:
+                    dt = datetime.fromisoformat(last_post_date)
+            else:
+                dt = last_post_date
+
+            days = (datetime.now(timezone.utc) - dt).days
+            days_inactive = days
+            last_post_str = dt.strftime("%Y-%m-%d")
+            if days > INACTIVITY_DAYS_THRESHOLD:
+                is_inactive_2mo = True
+        except Exception:
+            pass
+
+    # Bot profile detection
+    is_default_avatar = "default_profile_normal" in profile_image_url or "default_profile_images" in profile_image_url
+    is_ratio_bot = (friends_count > 1000 and followers_count < 5 and statuses_count == 0)
+    is_bot_suspect = is_default_avatar or is_ratio_bot
+
+    # -------------------------------------------------------------
+    # 1. IMMUTABLE SAFETY WHITELIST (Never Unfollow)
+    # -------------------------------------------------------------
     if screen_name in CORE_PROTECTED_HANDLES or rest_id in CORE_PROTECTED_HANDLES:
-        return "PROTECTED_WHITELIST", "Hardcoded Core Designated Handle"
+        return "PROTECTED_WHITELIST", "Hardcoded Designated Handle", is_bot_suspect, days_inactive, last_post_str
 
     if screen_name in custom_whitelist or rest_id in custom_whitelist:
-        return "PROTECTED_WHITELIST", "User Custom Whitelist File"
+        return "PROTECTED_WHITELIST", "Custom User Whitelist", is_bot_suspect, days_inactive, last_post_str
 
-    # Rule 2: Mutual Connection (Follows You Back)
     if profile.get("followed_by") is True:
-        return "PROTECTED_WHITELIST", "Mutual Connection (Follows Back)"
+        return "PROTECTED_WHITELIST", "Mutual Connection (Follows Back)", is_bot_suspect, days_inactive, last_post_str
 
-    # Rule 3: Verified Accounts
     if profile.get("is_verified") or profile.get("is_blue_verified") or profile.get("verified"):
-        return "PROTECTED_WHITELIST", "Verified Authority / Institution"
+        return "PROTECTED_WHITELIST", "Verified Authority / Institution", is_bot_suspect, days_inactive, last_post_str
 
-    # Rule 4: Niche Engineering & AI Keywords in Bio
     matched_kws = [kw for kw in ENGINEERING_KEYWORDS if kw in bio]
     if matched_kws:
-        return "PROTECTED_WHITELIST", f"Bio Keyword Match ({', '.join(matched_kws[:3])})"
+        return "PROTECTED_WHITELIST", f"Bio Keyword Match ({', '.join(matched_kws[:3])})", is_bot_suspect, days_inactive, last_post_str
 
-    return "CANDIDATE_UNFOLLOW", "Non-Mutual & Non-Engineering Profile"
+    # -------------------------------------------------------------
+    # 2. TARGETING & PURGE CRITERIA (Flag for Unfollow)
+    # -------------------------------------------------------------
+    if is_bot_suspect:
+        bot_reason = "Default Avatar" if is_default_avatar else "Follow Ratio Anomaly"
+        return "UNFOLLOW_BOT", f"Suspected Bot/Spam ({bot_reason})", True, days_inactive, last_post_str
 
-def execute_unfollow(screen_name, user_id=None):
-    """Sends authenticated unfollow request using screen_name or user_id."""
+    if is_inactive_2mo:
+        return "UNFOLLOW_GHOST", f"Ghost Account (Inactive for {days_inactive} days > 2 months)", False, days_inactive, last_post_str
+
+    if statuses_count == 0:
+        return "UNFOLLOW_GHOST", "Ghost Account (0 Total Posts)", False, days_inactive, last_post_str
+
+    return "UNFOLLOW_IRRELEVANT", "Non-Mutual & Non-Engineering Profile", False, days_inactive, last_post_str
+
+def export_audit_csv(audited_records, output_csv=AUDIT_CSV_FILE):
+    """Exports structured audit results to following_cleanup_audit.csv."""
+    fieldnames = [
+        "screen_name",
+        "name",
+        "user_id",
+        "followed_by",
+        "is_verified",
+        "last_post_date",
+        "days_inactive",
+        "is_bot_suspect",
+        "verdict",
+        "reason",
+        "bio"
+    ]
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in audited_records:
+            writer.writerow({
+                "screen_name": rec.get("screen_name", ""),
+                "name": rec.get("name", ""),
+                "user_id": rec.get("user_id", ""),
+                "followed_by": rec.get("followed_by", False),
+                "is_verified": rec.get("is_verified", False),
+                "last_post_date": rec.get("last_post_date", "Unknown"),
+                "days_inactive": rec.get("days_inactive", "N/A"),
+                "is_bot_suspect": rec.get("is_bot_suspect", False),
+                "verdict": rec.get("verdict", ""),
+                "reason": rec.get("reason", ""),
+                "bio": rec.get("bio", "")
+            })
+    print(f"[+] Audit CSV successfully generated at: {output_csv}")
+
+def execute_unfollow(user_id_or_screen_name):
+    """Sends authenticated unfollow request to X API."""
     data = {}
-    if screen_name:
-        data["screen_name"] = str(screen_name)
-    if user_id and str(user_id).isdigit():
-        data["user_id"] = str(user_id)
+    if str(user_id_or_screen_name).isdigit():
+        data["user_id"] = str(user_id_or_screen_name)
+    else:
+        data["screen_name"] = str(user_id_or_screen_name)
 
     try:
         response = session.post(UNFOLLOW_API_URL, data=data, timeout=20)
@@ -189,145 +294,183 @@ def execute_unfollow(screen_name, user_id=None):
     elif response.status_code == 403:
         return "forbidden", "HTTP 403 Forbidden (Session token expired or blocked)", 0
     elif response.status_code == 404:
-        return "not_found", "User already deactivated or unfollowed", 0
+        return "not_found", "User already deactivated, suspended, or unfollowed", 0
     else:
         return "failed", f"HTTP {response.status_code}: {response.text[:100]}", 0
 
 def run():
-    parser = argparse.ArgumentParser(description="X (Twitter) Ghost & Bot Purger")
-    parser.add_argument("--dry-run", action="store_true", help="Preview candidate accounts without unfollowing")
+    parser = argparse.ArgumentParser(description="X (Twitter) Ghost & Bot Account Purger")
+    parser.add_argument("--dry-run", action="store_true", help="Audit and preview candidates without calling mutation API")
     parser.add_argument("--live-run", action="store_true", help="Execute live throttled unfollow loop")
     parser.add_argument("--auto", action="store_true", help="Non-interactive mode for CI/CD runners (GitHub Actions)")
-    parser.add_argument("--limit", type=int, default=60, help="Maximum unfollows per run (default: 60)")
-    parser.add_argument("--min-sleep", type=float, default=25.0, help="Minimum jittered sleep (default: 25s)")
-    parser.add_argument("--max-sleep", type=float, default=55.0, help="Maximum jittered sleep (default: 55s)")
+    parser.add_argument("--limit", type=int, default=60, help="Maximum unfollows per run (default: 60, recommended: 50-75)")
+    parser.add_argument("--min-sleep", type=float, default=25.0, help="Minimum jittered sleep interval in seconds (default: 25.0)")
+    parser.add_argument("--max-sleep", type=float, default=55.0, help="Maximum jittered sleep interval in seconds (default: 55.0)")
     args = parser.parse_args()
 
     auto_mode = args.auto or os.getenv("CI") == "true" or "--auto" in sys.argv
 
     print("=" * 65)
     print("      X (Twitter) Ghost, Bot & Inactivity Pruning Engine      ")
+    print(f"      (Inactivity Threshold: {INACTIVITY_DAYS_THRESHOLD} Days / 2 Months)      ")
     print("=" * 65)
 
-    profiles = load_profiles_dataset()
-    if not profiles:
-        print("[!] No profile data found. Exiting.")
+    # 1. Ingest Following Data
+    raw_accounts = load_following_dataset()
+    if not raw_accounts:
+        print("[!] No following accounts found to audit. Exiting.")
         return
 
-    print(f"[+] Loaded {len(profiles)} rich user profiles from '{PROFILES_JSON_FILE}'.")
+    print(f"[+] Total Following Profiles Loaded: {len(raw_accounts)}")
+
+    # 2. Load Whitelists and History
     custom_whitelist = load_whitelist()
     print(f"[+] Loaded {len(custom_whitelist)} Custom Whitelist Handles from '{WHITELIST_FILE}'.")
     unfollowed_history = load_unfollowed_history()
     print(f"[+] Loaded {len(unfollowed_history)} Previously Unfollowed Accounts from History.")
 
-    audited = []
-    protected = []
-    candidates = []
-    already_done = 0
+    # 3. Audit and Categorize Accounts
+    print("\n[*] Auditing accounts against targeting and whitelist criteria...")
+    audited_records = []
+    protected_count = 0
+    ghost_count = 0
+    bot_count = 0
+    irrelevant_count = 0
+    already_unfollowed_count = 0
+    unfollow_queue = []
 
-    for p in profiles:
-        s_name = p.get("screen_name", "").strip().lower()
-        r_id = str(p.get("rest_id", "") or p.get("id_str", "")).strip().lower()
+    for item in raw_accounts:
+        rest_id = str(item.get("rest_id", "") or item.get("id_str", "")).strip()
+        screen_name = str(item.get("screen_name", "")).strip().lstrip("@")
+        identifier = rest_id or screen_name
 
-        if s_name in unfollowed_history or r_id in unfollowed_history:
-            already_done += 1
+        if identifier in unfollowed_history or screen_name.lower() in unfollowed_history:
+            record = {
+                "screen_name": screen_name,
+                "name": item.get("name", ""),
+                "user_id": rest_id,
+                "followed_by": item.get("followed_by", False),
+                "is_verified": item.get("is_verified", False) or item.get("is_blue_verified", False),
+                "last_post_date": "N/A",
+                "days_inactive": "N/A",
+                "is_bot_suspect": False,
+                "verdict": "ALREADY_UNFOLLOWED",
+                "reason": "Processed in previous run",
+                "bio": item.get("description", "")
+            }
+            already_unfollowed_count += 1
+            audited_records.append(record)
             continue
 
-        verdict, reason = evaluate_profile(p, custom_whitelist)
+        verdict, reason, is_bot, days_inactive, last_post_str = evaluate_account(item, custom_whitelist)
+
         record = {
-            "screen_name": p.get("screen_name", ""),
-            "name": p.get("name", ""),
-            "user_id": p.get("rest_id", "") or p.get("id_str", ""),
-            "followed_by": p.get("followed_by", False),
-            "is_verified": p.get("is_verified", False) or p.get("is_blue_verified", False) or p.get("verified", False),
-            "bio": p.get("description", "").replace("\n", " "),
+            "screen_name": screen_name,
+            "name": item.get("name", ""),
+            "user_id": rest_id,
+            "followed_by": item.get("followed_by", False),
+            "is_verified": item.get("is_verified", False) or item.get("is_blue_verified", False) or item.get("verified", False),
+            "last_post_date": last_post_str,
+            "days_inactive": days_inactive,
+            "is_bot_suspect": is_bot,
             "verdict": verdict,
-            "reason": reason
+            "reason": reason,
+            "bio": item.get("description", "")
         }
 
         if verdict == "PROTECTED_WHITELIST":
-            protected.append(record)
+            protected_count += 1
+        elif verdict == "UNFOLLOW_GHOST":
+            ghost_count += 1
+            unfollow_queue.append(record)
+        elif verdict == "UNFOLLOW_BOT":
+            bot_count += 1
+            unfollow_queue.append(record)
         else:
-            candidates.append(record)
+            irrelevant_count += 1
+            unfollow_queue.append(record)
 
-        audited.append(record)
+        audited_records.append(record)
 
-    # Export Audit CSV
-    fieldnames = ["screen_name", "name", "user_id", "followed_by", "is_verified", "bio", "verdict", "reason"]
-    with open(AUDIT_CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in audited:
-            writer.writerow(r)
+    # 4. Generate CSV Report
+    export_audit_csv(audited_records)
 
-    print(f"[+] Full audit report exported to: {AUDIT_CSV_FILE}")
+    # 5. Print Summary Statistics
+    total_slated = len(unfollow_queue)
     print("\n" + "-" * 55)
-    print("AUDIT SUMMARY STATS:")
-    print(f"   * Total Profiles Evaluated:    {len(profiles)}")
-    print(f"   * Already Unfollowed:          {already_done}")
-    print(f"   * PROTECTED BY WHITELIST:      {len(protected)}")
-    print(f"   * CANDIDATES FOR UNFOLLOW:     {len(candidates)}")
+    print("AUDIT & PURGE SUMMARY STATS:")
+    print(f"   * Total Scanned:             {len(raw_accounts)}")
+    print(f"   * Already Unfollowed:        {already_unfollowed_count}")
+    print(f"   * 🛡️ PROTECTED BY WHITELIST:  {protected_count}")
+    print(f"   * Flagged Inactive (>2 mo):  {ghost_count}")
+    print(f"   * Flagged Bots / Spam:       {bot_count}")
+    print(f"   * Flagged Non-Mutual Other:  {irrelevant_count}")
+    print(f"   👉 TOTAL CANDIDATES:         {total_slated}")
     print("-" * 55)
 
-    if not candidates:
-        print("\n[+] All candidate accounts have been pruned! Following list is 100% clean.")
+    if total_slated == 0:
+        print("\n[+] All non-whitelisted accounts have been pruned! Your following list is 100% clean.")
         return
 
-    batch = candidates[:args.limit]
-    print(f"\n[*] Processing Batch Size: {len(batch)} (Safety Cap: {args.limit})")
+    # Cap to safety limit
+    batch = unfollow_queue[:args.limit]
+    print(f"\n[*] Processing Batch Size: {len(batch)} (Safety Cap: {args.limit} per session)")
 
-    # Dry-run
+    # 6. Dry-Run Mode
     if args.dry_run:
-        print("\n[!] === DRY-RUN PREVIEW (No API requests made) ===")
+        print("\n[!] === DRY-RUN PREVIEW (No API mutations performed) ===")
         for i, target in enumerate(batch, 1):
-            print(f"  [{i}/{len(batch)}] Would Unfollow: @{target['screen_name']} ({target['name']})")
-            print(f"      Reason: {target['reason']}")
-        print(f"\n[+] Dry-run finished. Run with '--live-run' to execute live.")
+            s_name = f"@{target['screen_name']}" if target['screen_name'] else f"ID {target['user_id']}"
+            print(f"  [{i}/{len(batch)}] [DRY-RUN] Would Unfollow: {s_name} ({target['name']}) | Reason: {target['reason']}")
+        print(f"\n[+] Dry-run simulation finished. Run with '--live-run' to execute live.")
         return
 
-    # Live run
+    # 7. Live Execution Mode
     if not (args.live_run or auto_mode):
         confirm = input("\nType 'UNFOLLOW' to confirm live execution (or Ctrl+C to abort): ")
         if confirm.strip() != "UNFOLLOW":
-            print("[!] Aborted by user.")
+            print("[!] Operation aborted by user.")
             return
 
-    print("\n[*] Starting live throttled unfollow loop...")
+    print("\n[*] Starting throttled live unfollow execution loop...")
     success_count = 0
 
     for i, target in enumerate(batch, 1):
+        user_id = target["user_id"]
         s_name = target["screen_name"]
-        u_id = target["user_id"]
+        target_param = user_id if user_id else s_name
 
         print(f"[{i}/{len(batch)}] Unfollowing @{s_name} ({target['name']})...", end="", flush=True)
 
-        status, msg, wait_sec = execute_unfollow(s_name, u_id)
+        status, msg, wait_sec = execute_unfollow(target_param)
 
         if status in ("success", "not_found"):
             success_count += 1
-            record_unfollow_success(s_name, u_id)
+            record_unfollow_success(user_id or s_name, s_name)
             print(f" [OK] ({status})")
         elif status == "rate_limited":
             print(f" [429 Rate Limited] Waiting {wait_sec}s...")
             time.sleep(wait_sec)
-            retry_status, _, _ = execute_unfollow(s_name, u_id)
+            retry_status, _, _ = execute_unfollow(target_param)
             if retry_status == "success":
                 success_count += 1
-                record_unfollow_success(s_name, u_id)
-                print("    ↳ Retry Successful [OK]")
+                record_unfollow_success(user_id or s_name, s_name)
+                print(f"    ↳ Retry Successful [OK]")
         elif status == "forbidden":
             print(f" [403 Forbidden] {msg}")
-            print("[!] Halting execution to protect account safety.")
+            print("[!] Halting execution immediately to protect account safety.")
             break
         else:
             print(f" [Failed] {msg}")
 
+        # Anti-ban jittered sleep between requests
         if i < len(batch):
             sleep_time = random.uniform(args.min_sleep, args.max_sleep)
-            print(f"    Sleeping {sleep_time:.1f}s (anti-ban safety throttle)...")
+            print(f"    ⏳ Jittered sleep: {sleep_time:.1f}s (anti-ban safety throttle)...")
             time.sleep(sleep_time)
 
-    print(f"\n[+] Session complete! Successfully unfollowed {success_count} accounts.")
+    print(f"\n[+] Session Complete! Successfully unfollowed {success_count} accounts.")
+    print(f"[+] Progress logged to '{PROGRESS_JSON_FILE}' and '{HISTORY_LOG_FILE}'.")
 
 if __name__ == "__main__":
     run()

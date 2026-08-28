@@ -3,10 +3,22 @@
 # Add handles or user IDs (one per line) that should NEVER be unfollowed.
 # ==============================================================================
 
-# Core Designated Handles (Always Protected)
+# Core Designated Handles
 pau_nigeria
 IkejaElectric
 vireontech
 
-# Add your personal friends, mentors, or collaborators below:
-# example_handle
+# Kept from Review
+AneraResearch
+jakeshieldsajj
+dmoonlives
+lunaraesth
+Bonkytheidiot
+JobFound5
+iamasoothsayer
+DeleFarotimi
+RT_com
+aristomarinetti
+xueqinjiang
+Remnantize
+NickJFuentes
